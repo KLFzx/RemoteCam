@@ -10,6 +10,8 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -32,6 +34,7 @@ import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+
 class CamEngine(val context: Context) {
 
     var http: HttpService? = null
@@ -41,6 +44,7 @@ class CamEngine(val context: Context) {
     var insidePause = false
 
     var isShowingPreview: Boolean = false
+    private var isRestartingStream: Boolean = false
 
     private var cameraManager: CameraManager =
         context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -86,9 +90,10 @@ class CamEngine(val context: Context) {
     var viewState: CameraFragment.Companion.ViewState = CameraFragment.Companion.ViewState(
         true,
         stream = false,
-        cameraId = "0",
+        cameraId = cameraList.first().cameraId,
         quality = 80,
-        resolutionIndex = null
+        resolutionIndex = null,
+        zoomLevel = 1.0f
     )
 
     /** [CameraCharacteristics] corresponding to the provided Camera ID */
@@ -113,13 +118,23 @@ class CamEngine(val context: Context) {
     private var session: CameraCaptureSession? = null
 
     private fun stopRunning() {
-        if (session != null) {
-            Log.i("CAMERA", "close")
-            session!!.stopRepeating()
-            session!!.close()
-            session = null
-            camera.close()
-            imageReader.close()
+        try {
+            if (session != null) {
+                Log.i("CAMERA", "Stopping camera session")
+                session!!.stopRepeating()
+                session!!.close()
+                session = null
+            }
+            if (::camera.isInitialized) {
+                Log.i("CAMERA", "Closing camera")
+                camera.close()
+            }
+            if (::imageReader.isInitialized) {
+                Log.i("CAMERA", "Closing image reader")
+                imageReader.close()
+            }
+        } catch (e: Exception) {
+            Log.w("CAMERA", "Error stopping camera: ${e.message}")
         }
     }
 
@@ -133,14 +148,16 @@ class CamEngine(val context: Context) {
     private suspend fun openCamera(
         manager: CameraManager,
         cameraId: String,
+        logicalCameraId: String?,
         handler: Handler? = null
     ): CameraDevice = suspendCancellableCoroutine { cont ->
-        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+
+        val idToOpen = logicalCameraId ?: cameraId;
+        manager.openCamera(idToOpen, object : CameraDevice.StateCallback() {
             override fun onOpened(device: CameraDevice) = cont.resume(device)
 
             override fun onDisconnected(device: CameraDevice) {
                 Log.w("CamEngine", "Camera $cameraId has been disconnected")
-
             }
 
             override fun onError(device: CameraDevice, error: Int) {
@@ -165,35 +182,58 @@ class CamEngine(val context: Context) {
      */
     private suspend fun createCaptureSession(
         device: CameraDevice,
+        physicalCamId: String?,
         targets: List<Surface>,
         handler: Handler? = null
     ): CameraCaptureSession = suspendCoroutine { cont ->
+        val outputConfigs = mutableListOf<OutputConfiguration>();
+        targets.forEach {
+            outputConfigs.add(OutputConfiguration(it).apply {
+                // If physical camera id is not null, it's a logical cam, you should set it
+                if (physicalCamId != null) {
+                    setPhysicalCameraId(physicalCamId)
+                }
+            })
+        }
 
         // Create a capture session using the predefined targets; this also involves defining the
         // session state callback to be notified of when the session is ready
-        device.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
+        val sessionConfiguration = SessionConfiguration(
+            SessionConfiguration.SESSION_REGULAR,
+            outputConfigs,
+            Executors.newSingleThreadExecutor(),
+            object : CameraCaptureSession.StateCallback() {
 
-            override fun onConfigured(session: CameraCaptureSession) = cont.resume(session)
+                override fun onConfigured(session: CameraCaptureSession) = cont.resume(session)
 
-            override fun onConfigureFailed(session: CameraCaptureSession) {
-                val exc = RuntimeException("Camera ${device.id} session configuration failed")
-                Log.e("CamEngine", exc.message, exc)
-                cont.resumeWithException(exc)
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    val exc = RuntimeException("Camera ${device.id} session configuration failed")
+                    Log.e("CamEngine", exc.message, exc)
+                    cont.resumeWithException(exc)
+                }
             }
-        }, handler)
+        )
+
+        device.createCaptureSession(sessionConfiguration)
     }
 
     suspend fun initializeCamera() {
-        Log.i("CAMERA", "initializeCamera")
-
+        Log.i("CAMERA", "initializeCamera - preview: ${viewState.preview}, surface: ${previewSurface != null}")
 
         val showLiveSurface = viewState.preview && !insidePause && previewSurface != null
         isShowingPreview = showLiveSurface
 
+        // Stop current session before reinitializing
         stopRunning()
 
+        // Small delay to ensure previous session is fully closed
+        kotlinx.coroutines.delay(100)
 
         characteristics = cameraManager.getCameraCharacteristics(viewState.cameraId)
+        
+        // Check zoom capabilities
+        val maxZoom = characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1.0f
+        Log.i("CAMERA", "Max digital zoom supported: $maxZoom")
         sizes = characteristics.get(
             CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
         )!!.getOutputSizes(camOutPutFormat).reversed()
@@ -212,18 +252,21 @@ class CamEngine(val context: Context) {
         resH = sizes[viewState.resolutionIndex!!].height
 
 
-
-        camera = openCamera(cameraManager, viewState.cameraId, cameraHandler)
+        val sensor = cameraList.find { it.cameraId == viewState.cameraId }!!
+        camera = openCamera(cameraManager, sensor.cameraId, sensor.logicalCameraId, cameraHandler)
         imageReader = ImageReader.newInstance(
             resW, resH, camOutPutFormat, 4
         )
         var targets = listOf(imageReader.surface)
         if (showLiveSurface) {
-
-
             targets = targets.plus(previewSurface!!)
         }
-        session = createCaptureSession(camera, targets, cameraHandler)
+        session = createCaptureSession(
+            camera,
+            if (sensor.logicalCameraId == null) null else sensor.cameraId,
+            targets,
+            cameraHandler
+        )
         val captureRequest = camera.createCaptureRequest(
             CameraDevice.TEMPLATE_RECORD //TEMPLATE_PREVIEW
         )
@@ -232,6 +275,27 @@ class CamEngine(val context: Context) {
         }
         captureRequest.addTarget(imageReader.surface)
         captureRequest.set(CaptureRequest.JPEG_QUALITY, viewState.quality.toByte())
+        
+        // Apply zoom level using crop region (API 28 compatible)
+        try {
+            val zoomLevel = viewState.zoomLevel
+            Log.i("CAMERA", "Setting zoom level: $zoomLevel")
+            
+            if (zoomLevel > 1.0f) {
+                val activeArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                if (activeArraySize != null) {
+                    val cropWidth = (activeArraySize.width() / zoomLevel).toInt()
+                    val cropHeight = (activeArraySize.height() / zoomLevel).toInt()
+                    val cropX = (activeArraySize.width() - cropWidth) / 2
+                    val cropY = (activeArraySize.height() - cropHeight) / 2
+                    val zoomRect = android.graphics.Rect(cropX, cropY, cropX + cropWidth, cropY + cropHeight)
+                    captureRequest.set(CaptureRequest.SCALER_CROP_REGION, zoomRect)
+                    Log.i("CAMERA", "Applied crop region: $zoomRect")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("CAMERA", "Zoom not supported on this camera: ${e.message}")
+        }
         var lastTime = System.currentTimeMillis()
 
 
@@ -293,7 +357,81 @@ class CamEngine(val context: Context) {
             },
             cameraHandler
         )
+        // Note: Stream restart is handled separately in the surface change callback
+        // to avoid conflicts during camera initialization
+        
         updateView()
+    }
+    
+    fun updateZoomLevel() {
+        if (session != null) {
+            try {
+                Log.i("CAMERA", "Updating zoom level: ${viewState.zoomLevel}")
+                
+                // For significant zoom changes, restart the camera session to ensure proper preview
+                val shouldRestart = Math.abs(viewState.zoomLevel - 1.0f) > 0.5f
+                
+                if (shouldRestart) {
+                    Log.i("CAMERA", "Restarting camera for zoom change")
+                    runBlocking { initializeCamera() }
+                } else {
+                    // For small zoom changes, just update the capture request
+                    val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                    if (isShowingPreview && previewSurface != null) {
+                        captureRequest.addTarget(previewSurface!!)
+                    }
+                    captureRequest.addTarget(imageReader.surface)
+                    captureRequest.set(CaptureRequest.JPEG_QUALITY, viewState.quality.toByte())
+                    
+                    // Apply zoom level using crop region (API 28 compatible)
+                    val zoomLevel = viewState.zoomLevel
+                    
+                    if (zoomLevel > 1.0f) {
+                        val activeArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                        if (activeArraySize != null) {
+                            val cropWidth = (activeArraySize.width() / zoomLevel).toInt()
+                            val cropHeight = (activeArraySize.height() / zoomLevel).toInt()
+                            val cropX = (activeArraySize.width() - cropWidth) / 2
+                            val cropY = (activeArraySize.height() - cropHeight) / 2
+                            val zoomRect = android.graphics.Rect(cropX, cropY, cropX + cropWidth, cropY + cropHeight)
+                            captureRequest.set(CaptureRequest.SCALER_CROP_REGION, zoomRect)
+                            Log.i("CAMERA", "Applied crop region: $zoomRect")
+                        }
+                    }
+                    
+                    session!!.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
+                }
+            } catch (e: Exception) {
+                Log.w("CAMERA", "Failed to update zoom: ${e.message}")
+                // If zoom update fails, restart the camera
+                runBlocking { initializeCamera() }
+            }
+        }
+    }
+
+    fun restartStream() {
+        if (isRestartingStream) {
+            Log.i("CAMERA", "Stream restart already in progress, skipping")
+            return
+        }
+        
+        try {
+            isRestartingStream = true
+            Log.i("CAMERA", "Restarting stream in camera engine")
+            // Stop current HTTP service if it exists
+            if (http != null) {
+                http?.engine?.stop(500, 500)
+                Log.i("CAMERA", "Stopped existing HTTP service")
+            }
+            // Start new HTTP service
+            http = HttpService()
+            http?.main()
+            Log.i("CAMERA", "Stream restarted successfully")
+        } catch (e: Exception) {
+            Log.e("CAMERA", "Failed to restart stream: ${e.message}")
+        } finally {
+            isRestartingStream = false
+        }
     }
 
     fun destroy() {

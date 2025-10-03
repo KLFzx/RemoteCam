@@ -113,8 +113,41 @@ class Cam : Service() {
 
             "new_preview_surface" -> {
                 val surface: Surface? = intent.extras?.getParcelable("surface")
-                // Toast.makeText(this, "SURFACE", Toast.LENGTH_SHORT).show()
+                Log.i("CAM", "New preview surface received")
+                val oldSurface = engine?.previewSurface
                 engine?.previewSurface = surface
+                
+                // Always restart camera when surface changes (rotation, etc.)
+                if (engine?.viewState?.preview == true) {
+                    Log.i("CAM", "Restarting camera due to surface change")
+                    runBlocking { engine?.initializeCamera() }
+                }
+                
+                // Restart stream if it's active during rotation (with delay to avoid conflicts)
+                if (engine?.viewState?.stream == true) {
+                    Log.i("CAM", "Scheduling stream restart due to surface change (rotation)")
+                    // Use a background thread to restart stream after a delay
+                    Thread {
+                        try {
+                            Thread.sleep(500) // Wait for camera to stabilize
+                            restartStream()
+                        } catch (e: Exception) {
+                            Log.e("CAM", "Error in delayed stream restart: ${e.message}")
+                        }
+                    }.start()
+                }
+            }
+
+            "update_zoom" -> {
+                val zoomLevel = intent.getFloatExtra("zoomLevel", 1.0f)
+                Log.i("CAM", "Updating zoom level: $zoomLevel")
+                engine?.viewState?.zoomLevel = zoomLevel
+                engine?.updateZoomLevel()
+            }
+
+            "surface_destroyed" -> {
+                Log.i("CAM", "Surface destroyed, stopping preview")
+                engine?.previewSurface = null
                 if (engine?.viewState?.preview == true) {
                     runBlocking { engine?.initializeCamera() }
                 }
@@ -127,6 +160,23 @@ class Cam : Service() {
         }
 
         return START_STICKY
+    }
+
+    fun restartStream() {
+        try {
+            Log.i("CAM", "Restarting HTTP stream service")
+            // Stop current HTTP service if it exists
+            if (http != null) {
+                http?.engine?.stop(500, 500)
+                Log.i("CAM", "Stopped existing HTTP service")
+            }
+            // Start new HTTP service
+            http = HttpService()
+            http?.main()
+            Log.i("CAM", "HTTP stream service restarted")
+        } catch (e: Exception) {
+            Log.e("CAM", "Failed to restart stream: ${e.message}")
+        }
     }
 
     fun kill(){

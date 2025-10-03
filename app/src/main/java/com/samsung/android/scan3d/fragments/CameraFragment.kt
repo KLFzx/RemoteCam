@@ -136,6 +136,25 @@ class CameraFragment : Fragment() {
                 }
             })
 
+            // Setup zoom slider
+            fragmentCameraBinding.zoomSeekBar?.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: android.widget.SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (fromUser) {
+                        // Convert progress (0-100) to zoom level (1.0x - 10.0x)
+                        viewState.zoomLevel = 1.0f + (progress / 100.0f) * 9.0f
+                        sendViewState()
+                        
+                        // Send zoom update to camera engine
+                        Cac.sendCam {
+                            it.action = "update_zoom"
+                            it.putExtra("zoomLevel", viewState.zoomLevel)
+                        }
+                    }
+                }
+                override fun onStartTrackingTouch(seekBar: android.widget.SeekBar?) {}
+                override fun onStopTrackingTouch(seekBar: android.widget.SeekBar?) {}
+            })
+
             run {
                 val spinner = fragmentCameraBinding.spinnerCam
                 val spinnerDataList = ArrayList<Any>()
@@ -287,16 +306,31 @@ class CameraFragment : Fragment() {
         }
 
         fragmentCameraBinding.viewFinder.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceDestroyed(holder: SurfaceHolder) = Unit
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                Log.i("CameraFragment", "Surface destroyed")
+                // Notify camera engine that surface is no longer available
+                Cac.sendCam {
+                    it.action = "surface_destroyed"
+                }
+            }
 
             override fun surfaceChanged(
                 holder: SurfaceHolder,
                 format: Int,
                 width: Int,
                 height: Int
-            ) = Unit
+            ) {
+                Log.i("CameraFragment", "Surface changed: ${width}x${height}")
+                // Update aspect ratio and notify camera engine
+                fragmentCameraBinding.viewFinder.setAspectRatio(resW, resH)
+                Cac.sendCam {
+                    it.action = "new_preview_surface"
+                    it.putExtra("surface", fragmentCameraBinding.viewFinder.holder.surface)
+                }
+            }
 
             override fun surfaceCreated(holder: SurfaceHolder) {
+                Log.i("CameraFragment", "Surface created")
                 fragmentCameraBinding.viewFinder.setAspectRatio(
                     resW, resH
                 )
@@ -336,7 +370,8 @@ class CameraFragment : Fragment() {
             var stream: Boolean,
             var cameraId: String,
             var resolutionIndex: Int?,
-            var quality: Int
+            var quality: Int,
+            var zoomLevel: Float = 1.0f
         ) : Parcelable
 
     }
