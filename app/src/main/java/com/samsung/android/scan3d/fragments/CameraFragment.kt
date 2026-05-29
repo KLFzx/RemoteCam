@@ -21,11 +21,15 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.os.Bundle
 import android.os.Parcelable
 import android.util.Log
 import android.view.LayoutInflater
-import android.view.SurfaceHolder
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.widget.AdapterView
@@ -35,7 +39,6 @@ import android.widget.Toast
 import androidx.fragment.app.Fragment
 import androidx.navigation.NavController
 import androidx.navigation.Navigation
-import com.example.android.camera.utils.OrientationLiveData
 import com.samsung.android.scan3d.CameraActivity
 import com.samsung.android.scan3d.R
 import com.samsung.android.scan3d.databinding.FragmentCameraBinding
@@ -67,8 +70,8 @@ class CameraFragment : Fragment() {
 
     lateinit var Cac: CameraActivity
 
-    /** Live data listener for changes in the device orientation relative to the camera */
-    private lateinit var relativeOrientation: OrientationLiveData
+    private var cameraSurface: Surface? = null
+    private var currentCameraId: String? = null
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -114,10 +117,10 @@ class CameraFragment : Fragment() {
             val re = data.resolutions[data.resolutionSelected]
             resW = re.width
             resH = re.height
+            currentCameraId = data.sensorSelected.cameraId
 
             activity?.runOnUiThread(Runnable {
-
-                fragmentCameraBinding.viewFinder.setAspectRatio(resW, resH)
+                applyPreviewConfig()
             })
 
 
@@ -136,15 +139,13 @@ class CameraFragment : Fragment() {
                 }
             })
 
-            // Setup zoom slider
+            // Setup zoom slider — only push zoom changes through update_zoom (cheap path);
+            // never through sendViewState, which would diff the ViewState and trigger a full
+            // camera restart on every slider tick.
             fragmentCameraBinding.zoomSeekBar?.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: android.widget.SeekBar?, progress: Int, fromUser: Boolean) {
                     if (fromUser) {
-                        // Convert progress (0-100) to zoom level (1.0x - 10.0x)
                         viewState.zoomLevel = 1.0f + (progress / 100.0f) * 9.0f
-                        sendViewState()
-                        
-                        // Send zoom update to camera engine
                         Cac.sendCam {
                             it.action = "update_zoom"
                             it.putExtra("zoomLevel", viewState.zoomLevel)
@@ -245,8 +246,7 @@ class CameraFragment : Fragment() {
                         resW = outputFormats[p2].width
                         resH = outputFormats[p2].height
                         activity?.runOnUiThread(Runnable {
-
-                            fragmentCameraBinding.viewFinder.setAspectRatio(resW, resH)
+                            applyPreviewConfig()
                         })
                         if (p2 != viewState.resolutionIndex) {
                             viewState.resolutionIndex = p2
@@ -263,6 +263,44 @@ class CameraFragment : Fragment() {
         }
     }
 
+
+    private fun applyPreviewConfig() {
+        val binding = _fragmentCameraBinding ?: return
+        if (resW <= 0 || resH <= 0) return
+        binding.viewFinder.surfaceTexture?.setDefaultBufferSize(resW, resH)
+        val rotation = computeTotalRotation()
+        binding.viewFinder.setPreviewConfig(resW, resH, rotation)
+    }
+
+    private fun computeTotalRotation(): Int {
+        val ctx = context ?: return 90
+        val cameraId = currentCameraId ?: return 90
+        val sensorOrientation: Int
+        val isFrontFacing: Boolean
+        try {
+            val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val ch = cm.getCameraCharacteristics(cameraId)
+            sensorOrientation = ch.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            isFrontFacing = ch.get(CameraCharacteristics.LENS_FACING) ==
+                    CameraCharacteristics.LENS_FACING_FRONT
+        } catch (e: Exception) {
+            Log.w("CameraFragment", "Could not read sensor orientation: ${e.message}")
+            return 90
+        }
+        @Suppress("DEPRECATION")
+        val displayRotation = activity?.windowManager?.defaultDisplay?.rotation ?: Surface.ROTATION_0
+        val displayDeg = when (displayRotation) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        return if (isFrontFacing) {
+            (sensorOrientation + displayDeg) % 360
+        } else {
+            (sensorOrientation - displayDeg + 360) % 360
+        }
+    }
 
     fun sendViewState() {
         Cac.sendCam {
@@ -305,41 +343,38 @@ class CameraFragment : Fragment() {
             context?.sendBroadcast(intent)
         }
 
-        fragmentCameraBinding.viewFinder.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceDestroyed(holder: SurfaceHolder) {
-                Log.i("CameraFragment", "Surface destroyed")
-                // Notify camera engine that surface is no longer available
+        fragmentCameraBinding.viewFinder.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+                Log.i("CameraFragment", "SurfaceTexture available: ${width}x${height}")
+                texture.setDefaultBufferSize(resW, resH)
+                applyPreviewConfig()
+                cameraSurface?.release()
+                val surface = Surface(texture)
+                cameraSurface = surface
+                Cac.sendCam {
+                    it.action = "new_preview_surface"
+                    it.putExtra("surface", surface)
+                }
+            }
+
+            override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
+                Log.i("CameraFragment", "SurfaceTexture size changed: ${width}x${height}")
+                texture.setDefaultBufferSize(resW, resH)
+                applyPreviewConfig()
+            }
+
+            override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+                Log.i("CameraFragment", "SurfaceTexture destroyed")
                 Cac.sendCam {
                     it.action = "surface_destroyed"
                 }
+                cameraSurface?.release()
+                cameraSurface = null
+                return true
             }
 
-            override fun surfaceChanged(
-                holder: SurfaceHolder,
-                format: Int,
-                width: Int,
-                height: Int
-            ) {
-                Log.i("CameraFragment", "Surface changed: ${width}x${height}")
-                // Update aspect ratio and notify camera engine
-                fragmentCameraBinding.viewFinder.setAspectRatio(resW, resH)
-                Cac.sendCam {
-                    it.action = "new_preview_surface"
-                    it.putExtra("surface", fragmentCameraBinding.viewFinder.holder.surface)
-                }
-            }
-
-            override fun surfaceCreated(holder: SurfaceHolder) {
-                Log.i("CameraFragment", "Surface created")
-                fragmentCameraBinding.viewFinder.setAspectRatio(
-                    resW, resH
-                )
-                Cac.sendCam {
-                    it.action = "new_preview_surface"
-                    it.putExtra("surface", fragmentCameraBinding.viewFinder.holder.surface)
-                }
-            }
-        })
+            override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {}
+        }
     }
 
     override fun onStop() {
@@ -357,6 +392,8 @@ class CameraFragment : Fragment() {
     }
 
     override fun onDestroyView() {
+        cameraSurface?.release()
+        cameraSurface = null
         _fragmentCameraBinding = null
         super.onDestroyView()
     }

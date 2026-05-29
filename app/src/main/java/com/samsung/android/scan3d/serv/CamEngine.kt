@@ -110,12 +110,66 @@ class CamEngine(val context: Context) {
 
     private val cameraThread = HandlerThread("CameraThread").apply { start() }
     private val cameraHandler = Handler(cameraThread.looper)
+    private val initExecutor = Executors.newSingleThreadExecutor()
 
     private lateinit var camera: CameraDevice
 
     var previewSurface: Surface? = null
 
     private var session: CameraCaptureSession? = null
+
+    private var lastFrameTime = System.currentTimeMillis()
+    private var frameCounter = 0
+    private val acquiredCount = AtomicInteger(0)
+
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            if (!::imageReader.isInitialized) return
+            var lastImg = imageReader.acquireNextImage()
+            if (acquiredCount.get() > 1 && lastImg != null) {
+                lastImg.close()
+                lastImg = null
+            }
+            val img = lastImg ?: return
+            acquiredCount.incrementAndGet()
+            val curTime = System.currentTimeMillis()
+            val delta = curTime - lastFrameTime
+            lastFrameTime = curTime
+            frameCounter += 1
+
+            if (camOutPutFormat == ImageFormat.JPEG) {
+                val buffer = img.planes[0].buffer
+                val bytes = ByteArray(buffer.remaining()).apply { buffer.get(this) }
+                if (frameCounter % 10 == 0) {
+                    updateViewQuick(DataQuick(delta.toInt(), (30 * bytes.size / 1000)))
+                }
+                img.close()
+                acquiredCount.decrementAndGet()
+                if (viewState.stream) {
+                    http?.channel?.trySend(bytes)
+                }
+            }
+        }
+    }
+
+    private fun applyZoomTo(req: CaptureRequest.Builder) {
+        val zoomLevel = viewState.zoomLevel
+        if (zoomLevel <= 1.0f) return
+        val activeArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            ?: return
+        val cropWidth = (activeArraySize.width() / zoomLevel).toInt()
+        val cropHeight = (activeArraySize.height() / zoomLevel).toInt()
+        val cropX = (activeArraySize.width() - cropWidth) / 2
+        val cropY = (activeArraySize.height() - cropHeight) / 2
+        req.set(
+            CaptureRequest.SCALER_CROP_REGION,
+            android.graphics.Rect(cropX, cropY, cropX + cropWidth, cropY + cropHeight)
+        )
+    }
 
     private fun stopRunning() {
         try {
@@ -141,7 +195,24 @@ class CamEngine(val context: Context) {
     fun restart() {
         stopRunning()
         runBlocking { initializeCamera() }
+    }
 
+    fun initializeCameraAsync() {
+        initExecutor.execute {
+            try {
+                runBlocking { initializeCamera() }
+            } catch (e: Exception) {
+                Log.e("CAMERA", "Async init failed: ${e.message}", e)
+            }
+        }
+    }
+
+    fun stopPreviewSession() {
+        try {
+            session?.stopRepeating()
+        } catch (e: Exception) {
+            Log.w("CAMERA", "stopPreviewSession: ${e.message}")
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -275,137 +346,31 @@ class CamEngine(val context: Context) {
         }
         captureRequest.addTarget(imageReader.surface)
         captureRequest.set(CaptureRequest.JPEG_QUALITY, viewState.quality.toByte())
-        
-        // Apply zoom level using crop region (API 28 compatible)
-        try {
-            val zoomLevel = viewState.zoomLevel
-            Log.i("CAMERA", "Setting zoom level: $zoomLevel")
-            
-            if (zoomLevel > 1.0f) {
-                val activeArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-                if (activeArraySize != null) {
-                    val cropWidth = (activeArraySize.width() / zoomLevel).toInt()
-                    val cropHeight = (activeArraySize.height() / zoomLevel).toInt()
-                    val cropX = (activeArraySize.width() - cropWidth) / 2
-                    val cropY = (activeArraySize.height() - cropHeight) / 2
-                    val zoomRect = android.graphics.Rect(cropX, cropY, cropX + cropWidth, cropY + cropHeight)
-                    captureRequest.set(CaptureRequest.SCALER_CROP_REGION, zoomRect)
-                    Log.i("CAMERA", "Applied crop region: $zoomRect")
-                }
-            }
-        } catch (e: Exception) {
-            Log.w("CAMERA", "Zoom not supported on this camera: ${e.message}")
-        }
-        var lastTime = System.currentTimeMillis()
+        applyZoomTo(captureRequest)
 
+        lastFrameTime = System.currentTimeMillis()
+        frameCounter = 0
+        acquiredCount.set(0)
+        session!!.setRepeatingRequest(captureRequest.build(), captureCallback, cameraHandler)
 
-        var kodd = 0
-        var aquired = AtomicInteger(0)
-        session!!.setRepeatingRequest(
-            captureRequest.build(),
-            object : CameraCaptureSession.CaptureCallback() {
-
-                override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: TotalCaptureResult
-                ) {
-                    super.onCaptureCompleted(session, request, result)
-
-
-                    var lastImg = imageReader.acquireNextImage()
-
-                    if (aquired.get() > 1 && lastImg != null) {
-                        lastImg.close()
-                        Log.i("COM", "EARLY CLOSE")
-                        lastImg = null
-                    }
-
-                    val img = lastImg ?: return
-                    aquired.incrementAndGet()
-                    var curTime = System.currentTimeMillis()
-                    val delta = curTime - lastTime
-                    lastTime = curTime
-                    kodd += 1
-
-                    if (camOutPutFormat == ImageFormat.JPEG) {
-                        // executor.execute(Runnable {
-                        val buffer = img.planes[0].buffer
-                        val bytes = ByteArray(buffer.remaining()).apply { buffer.get(this) }
-
-                        if (kodd % 10 == 0) {
-                            updateViewQuick(
-                                DataQuick(
-                                    delta.toInt(),
-                                    (30 * bytes.size / 1000)
-                                )
-                            )
-                        }
-
-                        img.close()
-                        aquired.decrementAndGet()
-                        if (viewState.stream) {
-
-                            http?.channel?.trySend(
-                                bytes
-                            )
-
-                        }
-
-                    }
-                }
-            },
-            cameraHandler
-        )
-        // Note: Stream restart is handled separately in the surface change callback
-        // to avoid conflicts during camera initialization
-        
         updateView()
     }
-    
+
     fun updateZoomLevel() {
-        if (session != null) {
-            try {
-                Log.i("CAMERA", "Updating zoom level: ${viewState.zoomLevel}")
-                
-                // For significant zoom changes, restart the camera session to ensure proper preview
-                val shouldRestart = Math.abs(viewState.zoomLevel - 1.0f) > 0.5f
-                
-                if (shouldRestart) {
-                    Log.i("CAMERA", "Restarting camera for zoom change")
-                    runBlocking { initializeCamera() }
-                } else {
-                    // For small zoom changes, just update the capture request
-                    val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-                    if (isShowingPreview && previewSurface != null) {
-                        captureRequest.addTarget(previewSurface!!)
-                    }
-                    captureRequest.addTarget(imageReader.surface)
-                    captureRequest.set(CaptureRequest.JPEG_QUALITY, viewState.quality.toByte())
-                    
-                    // Apply zoom level using crop region (API 28 compatible)
-                    val zoomLevel = viewState.zoomLevel
-                    
-                    if (zoomLevel > 1.0f) {
-                        val activeArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-                        if (activeArraySize != null) {
-                            val cropWidth = (activeArraySize.width() / zoomLevel).toInt()
-                            val cropHeight = (activeArraySize.height() / zoomLevel).toInt()
-                            val cropX = (activeArraySize.width() - cropWidth) / 2
-                            val cropY = (activeArraySize.height() - cropHeight) / 2
-                            val zoomRect = android.graphics.Rect(cropX, cropY, cropX + cropWidth, cropY + cropHeight)
-                            captureRequest.set(CaptureRequest.SCALER_CROP_REGION, zoomRect)
-                            Log.i("CAMERA", "Applied crop region: $zoomRect")
-                        }
-                    }
-                    
-                    session!!.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
-                }
-            } catch (e: Exception) {
-                Log.w("CAMERA", "Failed to update zoom: ${e.message}")
-                // If zoom update fails, restart the camera
-                runBlocking { initializeCamera() }
+        val s = session ?: return
+        if (!::camera.isInitialized || !::imageReader.isInitialized) return
+        try {
+            val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+            if (isShowingPreview && previewSurface != null) {
+                captureRequest.addTarget(previewSurface!!)
             }
+            captureRequest.addTarget(imageReader.surface)
+            captureRequest.set(CaptureRequest.JPEG_QUALITY, viewState.quality.toByte())
+            applyZoomTo(captureRequest)
+
+            s.setRepeatingRequest(captureRequest.build(), captureCallback, cameraHandler)
+        } catch (e: Exception) {
+            Log.w("CAMERA", "Failed to update zoom: ${e.message}")
         }
     }
 

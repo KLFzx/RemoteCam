@@ -196,7 +196,9 @@ object Selector {
             else
                 "${desc.cameraId}@${desc.logicalCameraId}"
 
-            val title = "$camId vfov:$vfov $foc $ape $orientation"
+            val sensorOri = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: -1
+
+            val title = "$camId so:$sensorOri vfov:$vfov $foc $ape $orientation"
             if (!availableCameras.any { it -> it.title == title }) {
                 availableCameras.add(
                     SensorDesc(

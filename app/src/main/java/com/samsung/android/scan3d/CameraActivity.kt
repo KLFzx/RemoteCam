@@ -56,8 +56,12 @@ class CameraActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        sendCam {
-            it.action = "onPause"
+        // Skip the pause hook on rotation — the surface lifecycle handles the session
+        // reset, and switching to stream-only mode here would just churn the camera.
+        if (!isChangingConfigurations) {
+            sendCam {
+                it.action = "onPause"
+            }
         }
     }
 
@@ -73,8 +77,12 @@ class CameraActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        sendCam {
-            it.action = "stop"
+        // Don't tear down the camera service on a configuration change (rotation):
+        // the service must survive so the engine/HTTP stream stay alive.
+        if (!isChangingConfigurations) {
+            sendCam {
+                it.action = "stop"
+            }
         }
         unregisterReceiver(receiver)
     }

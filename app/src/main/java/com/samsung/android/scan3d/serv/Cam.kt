@@ -17,9 +17,6 @@ import com.samsung.android.scan3d.CameraActivity
 import com.samsung.android.scan3d.R
 import com.samsung.android.scan3d.fragments.CameraFragment
 import com.samsung.android.scan3d.http.HttpService
-import kotlinx.coroutines.runBlocking
-
-
 class Cam : Service() {
     var engine: CamEngine? = null
     var http: HttpService? = null
@@ -75,17 +72,17 @@ class Cam : Service() {
                 val notification: Notification = builer.build()
                 startForeground(123, notification) // Start the foreground service
 
-                http = HttpService()
-                http?.main()
-
+                if (http == null) {
+                    http = HttpService()
+                    http?.main()
+                }
             }
 
             "onPause" -> {
                 engine?.insidePause = true
                 if (engine?.isShowingPreview == true) {
-                    engine?.restart()
+                    engine?.initializeCameraAsync()
                 }
-
             }
 
             "onResume" -> {
@@ -93,64 +90,45 @@ class Cam : Service() {
             }
 
             "start_camera_engine" -> {
-                engine = CamEngine(this)
-                engine?.http = http
-                runBlocking { engine?.initializeCamera() }
+                if (engine == null) {
+                    engine = CamEngine(this)
+                    engine?.http = http
+                    engine?.initializeCameraAsync()
+                }
             }
 
             "new_view_state" -> {
-
                 val old = engine?.viewState!!
                 val new : CameraFragment.Companion.ViewState = intent.extras?.getParcelable("data")!!
                 Log.i("CAM", "new_view_state: " + new)
-                Log.i("CAM", "from:           " + old)
                 engine?.viewState =  new
                 if (old != new) {
-                    Log.i("CAM", "diff")
-                    engine?.restart()
+                    engine?.initializeCameraAsync()
                 }
             }
 
             "new_preview_surface" -> {
                 val surface: Surface? = intent.extras?.getParcelable("surface")
-                Log.i("CAM", "New preview surface received")
                 val oldSurface = engine?.previewSurface
-                engine?.previewSurface = surface
-                
-                // Always restart camera when surface changes (rotation, etc.)
-                if (engine?.viewState?.preview == true) {
-                    Log.i("CAM", "Restarting camera due to surface change")
-                    runBlocking { engine?.initializeCamera() }
-                }
-                
-                // Restart stream if it's active during rotation (with delay to avoid conflicts)
-                if (engine?.viewState?.stream == true) {
-                    Log.i("CAM", "Scheduling stream restart due to surface change (rotation)")
-                    // Use a background thread to restart stream after a delay
-                    Thread {
-                        try {
-                            Thread.sleep(500) // Wait for camera to stabilize
-                            restartStream()
-                        } catch (e: Exception) {
-                            Log.e("CAM", "Error in delayed stream restart: ${e.message}")
-                        }
-                    }.start()
+                if (surface == oldSurface) {
+                    Log.i("CAM", "Same surface, skipping re-init")
+                } else {
+                    Log.i("CAM", "New preview surface received")
+                    engine?.previewSurface = surface
+                    engine?.initializeCameraAsync()
                 }
             }
 
             "update_zoom" -> {
                 val zoomLevel = intent.getFloatExtra("zoomLevel", 1.0f)
-                Log.i("CAM", "Updating zoom level: $zoomLevel")
                 engine?.viewState?.zoomLevel = zoomLevel
                 engine?.updateZoomLevel()
             }
 
             "surface_destroyed" -> {
-                Log.i("CAM", "Surface destroyed, stopping preview")
+                Log.i("CAM", "Surface destroyed, stopping preview session")
                 engine?.previewSurface = null
-                if (engine?.viewState?.preview == true) {
-                    runBlocking { engine?.initializeCamera() }
-                }
+                engine?.stopPreviewSession()
             }
 
             else -> {
@@ -162,26 +140,11 @@ class Cam : Service() {
         return START_STICKY
     }
 
-    fun restartStream() {
-        try {
-            Log.i("CAM", "Restarting HTTP stream service")
-            // Stop current HTTP service if it exists
-            if (http != null) {
-                http?.engine?.stop(500, 500)
-                Log.i("CAM", "Stopped existing HTTP service")
-            }
-            // Start new HTTP service
-            http = HttpService()
-            http?.main()
-            Log.i("CAM", "HTTP stream service restarted")
-        } catch (e: Exception) {
-            Log.e("CAM", "Failed to restart stream: ${e.message}")
-        }
-    }
-
     fun kill(){
         engine?.destroy()
+        engine = null
         http?.engine?.stop(500,500)
+        http = null
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
     override fun onBind(intent: Intent?): IBinder? {
